@@ -9,49 +9,67 @@
 ; 2003.03.14:DonGo: Modified for 2440.
 ;=========================================
 
-	GET option.inc
-	GET memcfg.inc
-	GET 2440addr.inc
+	GET option.inc			;定义芯片相关配置
+	GET memcfg.inc			;定义存储器相关配置
+	GET 2440addr.inc		;定义寄存器符号
 
-BIT_SELFREFRESH EQU	(1<<22)
+BIT_SELFREFRESH EQU	(1<<22)		;用于节电模式中，SDRAM自动刷新
 
-;Pre-defined constants
-USERMODE    EQU 	0x10
-FIQMODE     EQU 	0x11
-IRQMODE     EQU 	0x12
-SVCMODE     EQU 	0x13
-ABORTMODE   EQU 	0x17
-UNDEFMODE   EQU 	0x1b
-MODEMASK    EQU 	0x1f
-NOINT       EQU 	0xc0
+;Pre-defined constants		;处理器模式常量: CPSR寄存器的后5位决定目前处理器模式 M[4:0]
+USERMODE    EQU 	0x10		;正常 ARM 程序执行状态
+FIQMODE     EQU 	0x11		;为支持数据传输或通道处理设计
+IRQMODE     EQU 	0x12		;用于一般用途的中断处理
+SVCMODE     EQU 	0x13		;操作系统保护模式
+ABORTMODE   EQU 	0x17		;数据或指令预取中止后进入
+UNDEFMODE   EQU 	0x1b		;执行了一个未定义指令时进入
+MODEMASK    EQU 	0x1f		;操作系统的特权用户模式 M[4:0]  
+NOINT       EQU 	0xc0		;禁止中断 （FIQ 禁止、IRQ 禁止）
 
-;The location of stacks
-UserStack	EQU	(_STACK_BASEADDRESS-0x3800)	;0x33ff4800 ~
+
+;定义处理器各模式下堆栈地址常量   
+;The location of stacks	
+UserStack	EQU	(_STACK_BASEADDRESS-0x3800)	;0x33ff4800 ~  _STACK_BASEADDRESS=0x33ff8000定义在option.inc中
 SVCStack	EQU	(_STACK_BASEADDRESS-0x2800)	;0x33ff5800 ~
 UndefStack	EQU	(_STACK_BASEADDRESS-0x2400)	;0x33ff5c00 ~
 AbortStack	EQU	(_STACK_BASEADDRESS-0x2000)	;0x33ff6000 ~
 IRQStack	EQU	(_STACK_BASEADDRESS-0x1000)	;0x33ff7000 ~
 FIQStack	EQU	(_STACK_BASEADDRESS-0x0)	;0x33ff8000 ~
 
+
+;arm处理器有两种工作状态 1.arm:32位 这种工作状态下执行字对准的arm指令 2.Thumb:16位 这种工作状
+;态执行半字对准的Thumb指令
+;因为处理器分为16位 32位两种工作状态 程序的编译器也是分16位和32两种编译方式 所以下面的程序用
+;于根据处理器工作状态确定编译器编译方式
+;code16伪指令指示汇编编译器后面的指令为16位的thumb指令
+;code32伪指令指示汇编编译器后面的指令为32位的arm指令
+;
+;Arm上电时处于ARM状态，故无论指令为ARM集或Thumb集，都先强制成ARM集，待init.s初始化完成后
+;再根据用户的编译配置转换成相应的指令模式。为此，定义变量THUMBCODE作为指示，跳转到main之前
+;根据其值切换指令模式
+;
+;这段是为了统一目前的处理器工作状态和软件编译方式（16位编译环境使用tasm.exe编译
 ;Check if tasm.exe(armasm -16 ...@ADS 1.0) is used.
-	GBLL    THUMBCODE
-	[ {CONFIG} = 16
-THUMBCODE SETL  {TRUE}
-	    CODE32
- 		|
-THUMBCODE SETL  {FALSE}
+	GBLL    THUMBCODE	;定义THUMBCODE全局变量注意EQU所定义的宏与变量的区别
+	[ {CONFIG} = 16		;如果发现是在用16位代码的话（编译选项中指定使用thumb指令）CONFIG变量由ADS中设置
+THUMBCODE SETL  {TRUE}	;一方面把THUMBCODE设置为TURE
+	    CODE32			;另一方面暂且把处理器设置成为ARM模式，以方便初始化
+ 		|				;（|表示else）如果编译选项本来就指定为ARM模式
+THUMBCODE SETL  {FALSE}	;把THUMBCODE设置为FALSE就行了
     ]
 
- 		MACRO
-	MOV_PC_LR
- 		[ THUMBCODE
-	    bx lr
- 		|
-	    mov	pc,lr
- 		]
-	MEND
+;MACRO伪操作标识宏定义的开始，MEND标识宏定义的结束。
+;用MACRO及MEND定义一段代码，称为宏定义体，这样在程序中就可以通过宏指令多次调用该代码段。 
 
- 		MACRO
+ 		MACRO	;一个根据THUMBCODE把PC寄存的值保存到LR的宏
+	MOV_PC_LR	;宏名称(完成子程序返回)
+ 		[ THUMBCODE	;如果定义了THUMBCODE，则
+	    bx lr	;在ARM模式中要使用BX指令转跳到THUMB指令,并转换模式. bx指令会根据PC最后1位来确定是否进入thumb状态
+ 		|			;否则
+	    mov	pc,lr	;如果目标地址也是ARM指令的话就采用这种方式
+ 		]
+	MEND			;宏定义结束标志
+
+ 		MACRO		;和上面的宏一样,只是多了一个相等的条件
 	MOVEQ_PC_LR
  		[ THUMBCODE
         bxeq lr
@@ -59,24 +77,72 @@ THUMBCODE SETL  {FALSE}
 	    moveq pc,lr
  		]
 	MEND
+		;=======================================================================================
+		;下面这个宏是用于第一次查表过程的实现中断向量的重定向,如果你比较细心的话就会发现
+		;在_ISR_STARTADDRESS=0x33FF_FF00里定义的第一级中断向量表是采用型如Handle***的方式的.
+		;而在程序的ENTRY处(程序开始处)采用的是b Handler***的方式.
+		;在这里Handler***就是通过HANDLER这个宏和Handle***建立联系的.
+		;这种方式的优点就是正真定义的向量数据在内存空间里,而不是在ENTRY处的ROM(FLASH)空间里,
+		;这样,我们就可以在程序里灵活的改动向量的数据了.
+		;========================================================================================
+		;;这段程序用于把中断服务程序的首地址装载到pc中，有人称之为“加载程序”。
+		;本初始化程序定义了一个数据区（在文件最后），34个字空间，存放相应中断服务程序的首地址。每个字
+		;空间都有一个标号，以Handle***命名。
+		;在向量中断模式下使用“加载程序”来执行中断服务程序。
+		;这里就必须讲一下向量中断模式和非向量中断模式的概念
+		;向量中断模式是当cpu读取位于0x18处的IRQ中断指令的时候，系统自动读取对应于该中断源确定地址上的;
+		;指令取代0x18处的指令，通过跳转指令系统就直接跳转到对应地址
+		;函数中 节省了中断处理时间提高了中断处理速度度 例如 ADC中断的向量地址为0xC0,则在0xC0处放如下
+		;代码：ldr PC,=HandlerADC 当ADC中断产生的时候系统会
+		;自动跳转到HandlerADC函数中
+		;非向量中断模式处理方式是一种传统的中断处理方法，当系统产生中断的时候，系统将interrupt
+		;pending寄存器中对应标志位置位 然后跳转到位于0x18处的统一中断
+		;函数中 该函数通过读取interrupt pending寄存器中对应标志位 来判断中断源 并根据优先级关系再跳到
+		;对应中断源的处理代码中
+		;
+		;H|------|			 H|------|		  H|------| 		  H|------| 		H|------|		
+		; |/ / / |			  |/ / / |		   |/ / / | 		   |/ / / | 		 |/ / / |		
+		; |------|<----sp	  |------|		   |------| 		   |------| 		 |------|<------sp 
+		;L| 	 |			  |------|<----sp L|------| 		   |-isr--| 		 |------| isr==>pc
+		; | 	 |			  | 	 |		   |--r0--|<----sp	   |---r0-|<----sp	L|------| r0==>r0
+		;	 (0)				(1) 			 (2)				  (3)				(4)
 
+;[各中断跳转处理，跳转到我们最后面定义的中断地址去处理]		 
  		MACRO
-$HandlerLabel HANDLER $HandleLabel
-
-$HandlerLabel
-	sub	sp,sp,#4	;decrement sp(to store jump address)
-	stmfd	sp!,{r0}	;PUSH the work register to stack(lr does not push because it return to original address)
-	ldr     r0,=$HandleLabel;load the address of HandleXXX to r0
-	ldr     r0,[r0]	 ;load the contents(service routine start address) of HandleXXX
-	str     r0,[sp,#4]      ;store the contents(ISR) of HandleXXX to stack
-	ldmfd   sp!,{r0,pc}     ;POP the work register and pc(jump to ISR)
+$HandlerLabel HANDLER $HandleLabel		;注意$HandlerLabel符号 比后面的$HandleLabel符号 多一个字母‘r’ ，相当于函数的形参
+;$HandlerLabel为ARM体现中统一定义的几种异常中断
+;$HandleLabel为ARM处理器中每个中断的定义，见中断向量表
+$HandlerLabel	 ;标号
+	sub	sp,sp,#4	;(1)减少sp，预留一个用来存储PC地址（因为stmfd是递减入栈的，又是arm（32位）模式所以减4）
+	stmfd	sp!,{r0}	;(2)把工作寄存器压入栈(lr does not push because it return to original address)
+	ldr     r0,=$HandleLabel	;将HandleXXX的址址放入r0
+	ldr     r0,[r0]	 			;把HandleXXX所指向的内容(也就是中断程序的入口地址)放入r0
+	str     r0,[sp,#4]       ;(3)中断服务函数的起始地址入栈
+	ldmfd   sp!,{r0,pc}     ;(4)将事先保存的r0寄存器和中断函数首地址出栈，并使系统跳转到相应的中断处理函数（跳转到下面的IsrIRQ函数处）
 	MEND
 
-	IMPORT  |Image$$RO$$Base|	; Base of ROM code
-	IMPORT  |Image$$RO$$Limit|  ; End of ROM code (=start of ROM data)
-	IMPORT  |Image$$RW$$Base|   ; Base of RAM to initialise
-	IMPORT  |Image$$ZI$$Base|   ; Base and limit of area
-	IMPORT  |Image$$ZI$$Limit|  ; to zero initialise
+	;首先这段程序是个宏定义，HANDLER是宏名，不要想歪了
+	;其次后面程序遇到的HandlerXXX HANDLER HandleXXX这些语句将都被上面这段程序展开
+			
+		;=========================================================================================
+		;在这里用IMPORT伪指令(和c语言的extren一样)引入|Image$$RO$$Base|,|Image$$RO$$Limit|...
+		;这些变量是通过ADS的工程设置里面设定的RO Base和RW Base设定的,
+		;最终由编译脚本和连接程序导入程序.
+		;那为什么要引入这玩意呢,最简单的用处是可以根据它们拷贝自已
+		;==========================================================================================
+		;Image$$RO$$Base等比较古怪的变量是编译器生成的。RO, RW, ZI这三个段都保存在Flash中，但RW，ZI在Flash中
+		;的地址肯定不是程序运行时变量所存储的位置，因此我们的程序在初始化时应该把Flash中的RW，ZI拷贝到RAM的对应位置。
+		;一般情况下，我们可以利用编译器替我们实现这个操作。比如我们跳转到main()时，使用 b	__Main,编译器就会在__Main
+		;和Main之间插入一段汇编代码，来替我们完成RW，ZI段的初始化。 如果我们使用 b	Main， 那么初始化工作要我们自己做。
+		;编译器会生成如下变量告诉我们RO，RW，ZI三个段应该位于什么位置，但是它并没有告诉我们RW，ZI在Flash中存储在什么位置，
+		;实际上RW，ZI在Flash中的位置就紧接着RO存储。我们知道了Image$$RO$$Base，Image$$RO$$Limit，那么Image$$RO$$Limit就
+		;是RW（ROM data）的开始。
+
+	IMPORT  |Image$$RO$$Base|	;RO起始地址
+	IMPORT  |Image$$RO$$Limit|  ;RO结束地址
+	IMPORT  |Image$$RW$$Base|   ;RW段起始地址
+	IMPORT  |Image$$ZI$$Base|   ;ZI段起始地址
+	IMPORT  |Image$$ZI$$Limit|  ;ZI段结束地址
 
 	IMPORT	MMU_SetAsyncBusMode
 	IMPORT	MMU_SetFastBusMode	;
