@@ -144,15 +144,18 @@ $HandlerLabel	 ;标号
 	IMPORT  |Image$$ZI$$Base|   ;ZI段起始地址
 	IMPORT  |Image$$ZI$$Limit|  ;ZI段结束地址
 
+	;导入两个关于MMU的函数，用于设置时钟模式为异步模式和快速总线模式
 	IMPORT	MMU_SetAsyncBusMode
 	IMPORT	MMU_SetFastBusMode	;
 
-	IMPORT  Main    ; The main entry of mon program
-	IMPORT  CopyProgramFromNand
-
+	IMPORT  Main    ;这里引入一些在其它文件中实现在函数,包括为我们所熟知的main函数
+	IMPORT  CopyProgramFromNand		;导入用于复制从Nand Flash中的映像文件到SDRAM中的函数
+;从这里开始就是正真的代码入口了!
 	AREA    Init,CODE,READONLY
-
-	ENTRY
+	;在入口处(0x0)开始的8个字单元空间内，存放的是ARM异常中断向量表，
+	;每个字单元空间都是一条跳转指令，当异常发生时，ARM会自动跳转到相
+	;应的中断向量处，并由该处的跳转指令再跳转到相应的执行函数处
+	ENTRY	;定义程序的入口(调试用)
 	
 	EXPORT	__ENTRY
 __ENTRY
@@ -161,41 +164,59 @@ ResetEntry
 	;2)The following little endian code will be compiled in Big-Endian mode.
 	;  The code byte order should be changed as the memory bus width.
 	;3)The pseudo instruction,DCD can not be used here because the linker generates error.
-	ASSERT	:DEF:ENDIAN_CHANGE
-	[ ENDIAN_CHANGE
-	    ASSERT  :DEF:ENTRY_BUS_WIDTH
-	    [ ENTRY_BUS_WIDTH=32
+;在0x0处的异常中断是复位异常中断，是上电后执行的第一条指令
+;变量ENDIAN_CHANGE用于标记是否要从小端模式改变为大端模式，因为编译器初始模式是小端模式，如果要用大端模式，就要事先把该变量设置为TRUE，否则为FLASE 
+;变量ENTRY_BUS_WIDTH用于设置总线的宽度，因为用16位和8位宽度来表示32位数据时，在大端模式下，数据的含义是不同的
+;由于要考虑到大端和小端模式，以及总线的宽度，因此该处看似较复杂，其实只是一条跳转指令:当为大端模式时，跳转到ChangeBigEndian函数处，否则跳转到ResetHandler函数处
+;条件编译，在编译成机器码前就设定好
+	ASSERT	:DEF:ENDIAN_CHANGE		;判断ENDIAN_CHANGE是否已定义
+	[ ENDIAN_CHANGE					;如果已经定义了ENDIAN_CHANGE，则（在Option.inc里已经设为FALSE ）
+	    ASSERT  :DEF:ENTRY_BUS_WIDTH	;判断ENTRY_BUS_WIDTH是否已定义
+	    [ ENTRY_BUS_WIDTH=32		;如果已经定义了ENTRY_BUS_WIDTH，则判断是不是为32
 		b	ChangeBigEndian	    ;DCD 0xea000007
 	    ]
-
+		;在bigendian中，地址为A的字单元包括字节单元A，A+1，A+2，A+3，字节单元由高位到低位为A，A+1，A+2，A+3
+		;	  地址为A的字单元包括半字单元A，A+2，半字单元由高位到低位为A，A+2
 	    [ ENTRY_BUS_WIDTH=16
-		andeq	r14,r7,r0,lsl #20   ;DCD 0x0007ea00
-	    ]
+		andeq	r14,r7,r0,lsl #20   ;DCD 0x0007ea00 也是b ChangeBigEndian指令，只是由于总线不一样而取机器码的顺序不一样
+	    ]						;先取低位->高位 上述指令是通过机器码转换而来的
 
 	    [ ENTRY_BUS_WIDTH=8
-		streq	r0,[r0,-r10,ror #1] ;DCD 0x070000ea
+		streq	r0,[r0,-r10,ror #1] ;DCD 0x070000ea 也是b ChangeBigEndian指令，只是由于总线不一样而取机器码的顺序不一样
 	    ]
 	|
-	    b	ResetHandler
+	    b	ResetHandler		;我们的程序由于ENDIAN_CHANGE设成FALSE就到这儿了,转跳到复位程序入口   	
     ]
 	b	HandlerUndef	;handler for Undefined mode
-	b	HandlerSWI	;handler for SWI interrupt
-	b	HandlerPabort	;handler for PAbort
-	b	HandlerDabort	;handler for DAbort
-	b	.		;reserved
-	b	HandlerIRQ	;handler for IRQ interrupt
+	b	HandlerSWI	;handler for SWI interrupt ;软件中断 
+	b	HandlerPabort	;handler for PAbort	;指令预取中止 
+	b	HandlerDabort	;handler for DAbort	;数据访问中止 
+	b	.		;reserved	;保留，跳转到自身地址处，即进入死循环 
+	b	HandlerIRQ	;handler for IRQ interrupt	;快速中断请求
 	b	HandlerFIQ	;handler for FIQ interrupt
+;以上为异常中断向量表 
 
-;@0x20
+;@0x20  当前位置地址是0x20,0到0x1c地址空间被中断向量所占用
+;跳转到EnterPWDN，处理电源管理的其他非正常模式，在C语言程序段中被调用 
+;该处地址为0x20，至于为什么要在该处执行，我认为可能是该处离异常中断向量表最近吧
 	b	EnterPWDN	; Must be @0x20.
+;由0x0跳转至此，目的是把小端模式改为大端模式，即把CP15中的寄存器C1中的第7位置1 
 ChangeBigEndian
-;@0x24
+;@0x24	当前位置地址是0x24
 	[ ENTRY_BUS_WIDTH=32
+		;执行mrc p15,0,r0,c1,c0,0，得到CP15中的寄存器C1，放入r0中 
+		;由于mrc p15,0,r0,c1,c0,0的机器码为0xee110f10
+		;因此DCD 0xee110f10的意思就是mrc 
 	    DCD	0xee110f10	;0xee110f10 => mrc p15,0,r0,c1,c0,0
+		;执行orr r0,r0,#0x80，置r0中的第7位为1，表示选择大端模式 
 	    DCD	0xe3800080	;0xe3800080 => orr r0,r0,#0x80;  //Big-endian
+		;执行mcr p15,0,r0,c1,c0,0，把r0写入CP15中的寄存器C1
 	    DCD	0xee010f10	;0xee010f10 => mcr p15,0,r0,c1,c0,0
 	]
 	[ ENTRY_BUS_WIDTH=16
+		;由于此时系统还不能识别16位或8位大端模式下表示的32为数据 
+		;因此还需人为地进行数据调整，即把0xee110f10变为0x0f10ee11 
+		;然后用DCD指令存入该数据。下同
 	    DCD 0x0f10ee11
 	    DCD 0x0080e380
 	    DCD 0x0f10ee01
@@ -205,13 +226,20 @@ ChangeBigEndian
 	    DCD 0x800080e3
 	    DCD 0x100f01ee
     ]
+		;相当于NOP指令 
+		;作用是等待系统从小端模式向大端模式转换
+		;此后系统就能够自动识别出不同总线宽度下的大端模式，因此以后就无需再人为调整指令了	
 	DCD 0xffffffff  ;swinv 0xffffff is similar with NOP and run well in both endian mode.
 	DCD 0xffffffff
 	DCD 0xffffffff
 	DCD 0xffffffff
 	DCD 0xffffffff
-	b ResetHandler
+	b ResetHandler	;跳转到ResetHandler
 	
+;这里采用HANDLER宏去建立Hander***和Handle***之间的联系
+;当系统进入异常中断后，由存放在0x0~0x1C处的中断向量地址中的跳转指令，跳转到此处相应的位置，
+;并由事先定义好的宏定义再次跳转到相应的中断服务程序中 
+
 HandlerFIQ      HANDLER HandleFIQ
 HandlerIRQ      HANDLER HandleIRQ
 HandlerUndef    HANDLER HandleUndef
@@ -219,37 +247,43 @@ HandlerSWI      HANDLER HandleSWI
 HandlerDabort   HANDLER HandleDabort
 HandlerPabort   HANDLER HandlePabort
 
+;下面这段代码是用于处理非向量中断，即由软件程序来判断到底发生了哪种中断，然后跳转到相应地中断服务程序中 
+;具体地说就是，当发生中断时，会置INTOFFSET寄存器相应的位为1，然后通过查表(见该程序末端部分的中断向量表)，找到相对应的中断入口地址 
+;观察中断向量表，会发现它与INTOFFSET寄存器中的中断源正好相对应，即向量表的顺序与INTOFFSET寄存器中的中断源的由小到大的顺序一致，因此我们可以用基址加变址的方式很容易找到相对应的中断入口地址。其中基址为向量表的首个中断源地址，变址为INTOFFSET寄存器的值乘以4(因为系统是用4个字节单元来存放一个中断向量)
 IsrIRQ
-	sub	sp,sp,#4       ;reserved for PC
-	stmfd	sp!,{r8-r9}
+	sub	sp,sp,#4       ;在栈中留出4个字节空间，以便保存中断入口地址
+	stmfd	sp!,{r8-r9}	;由于要用到r8和r9，因此保存这两个寄存器内的值，即把r8-r9入栈保护 
 
-	ldr	r9,=INTOFFSET
-	ldr	r9,[r9]
-	ldr	r8,=HandleEINT0
-	add	r8,r8,r9,lsl #2
-	ldr	r8,[r8]
-	str	r8,[sp,#8]
-	ldmfd	sp!,{r8-r9,pc}
+	ldr	r9,=INTOFFSET	;把INTOFFSET寄存器地址装入r9内
+	ldr	r9,[r9]			;读取INTOFFSET寄存器内容 
+	ldr	r8,=HandleEINT0		;得到中断向量表的基址
+	add	r8,r8,r9,lsl #2		;用基址加变址的方式得到中断向量表的地址 
+	ldr	r8,[r8]				;得到中断服务程序入口地址 
+	str	r8,[sp,#8]			;使中断服务程序入口地址入栈
+	ldmfd	sp!,{r8-r9,pc}		;使r8，r9和入口地址出栈，并跳到中断服务程序中 
 
 
-	LTORG
+	LTORG		;定义一个数据缓冲池，供ldr伪指令使用
 
 ;=======
 ; ENTRY
 ;=======
-ResetHandler
-	ldr	r0,=WTCON       ;watch dog disable
+;系统上电或复位后，由0x0处的跳转指令，跳转到该处开始真正执行系统的初始化工作 
+ResetHandler	
+	ldr	r0,=WTCON      ;在系统初始化过程中，不需要看门狗，因此关闭看门狗功能
 	ldr	r1,=0x0
 	str	r1,[r0]
 
 	ldr	r0,=INTMSK
-	ldr	r1,=0xffffffff  ;all interrupt disable
+	ldr	r1,=0xffffffff  ;同样，此时也不应该响应任何中断，因此屏蔽所有中断，以及子中断 
 	str	r1,[r0]
 
 	ldr	r0,=INTSUBMSK
 	ldr	r1,=0x7fff		;all sub interrupt disable
 	str	r1,[r0]
-
+;由于启动文件是无法仿真的，因此为了判断该文件中语句的正确与否，往往在需要观察的地方加上一段点亮LED的程序，
+;这样就可以知道程序是否已经执行到此处 
+;下面方括号内的程序就是点亮LED的小程序
 	[ {TRUE}
 	;rGPFDAT = (rGPFDAT & ~(0xf<<4)) | ((~data & 0xf)<<4);
 	; Led_Display
@@ -260,7 +294,8 @@ ResetHandler
 	ldr	r1,=0x07fe
 	str	r1,[r0]
 	]
-
+;下列程序是用于设置系统时钟频率 
+;设置PLL的锁定时间常数，以得到一定时间的延时
 	;To reduce PLL lock time, adjust the LOCKTIME register.
 	ldr	r0,=LOCKTIME
 	ldr	r1,=0xffffff
@@ -269,6 +304,7 @@ ResetHandler
     [ PLL_ON_START
 	; Added for confirm clock divide. for 2440.
 	; Setting value Fclk:Hclk:Pclk
+	;设置系统的三个时钟频率FCLK、HCLK、PCLK 
 	ldr	r0,=CLKDIVN
 	ldr	r1,=CLKDIV_VAL		; 0=1:1:1, 1=1:1:2, 2=1:2:2, 3=1:2:4, 4=1:4:4, 5=1:4:8, 6=1:3:3, 7=1:3:6.
 	str	r1,[r0]
@@ -281,19 +317,24 @@ ResetHandler
 ;	]
 	;program has not been copied, so use these directly
 	[ CLKDIV_VAL>1 		; means Fclk:Hclk is not 1:1.
+	;设置时钟模式为异步模式 
 	mrc p15,0,r0,c1,c0,0
 	orr r0,r0,#0xc0000000;R1_nF:OR:R1_iA
 	mcr p15,0,r0,c1,c0,0
 	|
+	;设置时钟模式为快速总线模式
 	mrc p15,0,r0,c1,c0,0
 	bic r0,r0,#0xc0000000;R1_iA:OR:R1_nF
 	mcr p15,0,r0,c1,c0,0
 	]
-	
+	;配置UPLL 
+	;按照手册中的计算公式，确定MDIV、PDIV和SDIV
+	;得到当系统输入时钟频率为12MHz的情况下，UCLK输出频率为48MHz 
 	;Configure UPLL
 	ldr	r0,=UPLLCON
 	ldr	r1,=((U_MDIV<<12)+(U_PDIV<<4)+U_SDIV)  
 	str	r1,[r0]
+	;等待至少7个时钟周期，以保证系统的正确配置
 	nop	; Caution: After UPLL setting, at least 7-clocks delay must be inserted for setting hardware be completed.
 	nop
 	nop
@@ -301,28 +342,36 @@ ResetHandler
 	nop
 	nop
 	nop
+	;配置MPLL，同UPLL 
 	;Configure MPLL
 	ldr	r0,=MPLLCON
 	ldr	r1,=((M_MDIV<<12)+(M_PDIV<<4)+M_SDIV)  ;Fin=16.9344MHz
 	str	r1,[r0]
     ]
-
+;从SLEEP模式下被唤醒，类似于RESET引脚被触发，因此它也要从0x0处开始执行 
+;在此处要判断是否是由SLEEP模式唤醒引起的复位
 	;Check if the boot is caused by the wake-up from SLEEP mode.
 	ldr	r1,=GSTATUS2
 	ldr	r0,[r1]
-	tst	r0,#0x2
+	tst	r0,#0x2		;检查GSTATUS2寄存器的第1位
 	;In case of the wake-up from SLEEP mode, go to SLEEP_WAKEUP handler.
-	bne	WAKEUP_SLEEP
-
+	bne	WAKEUP_SLEEP	;是被唤醒的，则跳转
+;设置一个被唤醒复位后的起始点地址标号，可以把它保存到GSTATUS3中 
+;导出该地址标号，以便在C语言程序中使用 
 	EXPORT StartPointAfterSleepWakeUp
 StartPointAfterSleepWakeUp
-
+	;设置内存控制寄存器 
+	;关于内存控制寄存器一共有以BWSCON为开始的连续放置的13个寄存器，我们要一次性批量完成这13个寄存器的配置 
+	;因此开辟一段以SMRDATA为地址起始点的13个字单元空间，按顺序放入要写入的13个寄存器内容 
 	;Set memory control registers
  	;ldr	r0,=SMRDATA
  	adrl	r0, SMRDATA	;be careful!
+	;得到SMRDATA空间的首地址  
 	ldr	r1,=BWSCON	;BWSCON Address
+	;得到BWSCON的地址 
 	add	r2, r0, #52	;End address of SMRDATA
-
+	;得到SMRDATA空间的末地址 
+	;完成13个字数据的复制
 0
 	ldr	r3, [r0], #4
 	str	r3, [r1], #4
@@ -332,31 +381,33 @@ StartPointAfterSleepWakeUp
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;;;;;;;;;;;       When EINT0 is pressed,  Clear SDRAM 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-; check if EIN0 button is pressed
+; check if EIN0 button is pressed	;检查EIN0按钮是否被按下 
 
-       ldr	r0,=GPFCON
+    ldr	r0,=GPFCON
 	ldr	r1,=0x0
-	str	r1,[r0]
+	str	r1,[r0]		;GPFCON=0，F口为输入 
 	ldr	r0,=GPFUP
 	ldr	r1,=0xff
-	str	r1,[r0]
+	str	r1,[r0]		;GPFUP=0xff，上拉功能无效 
 
-	ldr	r1,=GPFDAT
+	ldr	r1,=GPFDAT		;读取F口数据 
 	ldr	r0,[r1]
        bic	r0,r0,#(0x1e<<1)  ; bit clear
-	tst	r0,#0x1
-	bne %F1
+	   ;仅保留第1位数据，其它清0 
+	tst	r0,#0x1		;判断第1位 
+	bne %F1		;不为0表示按钮没有被按下，则向前跳转，不执行清空SDRAM 
 	
 	
 
-; Clear SDRAM Start
+; Clear SDRAM Start	;清空SDRAM 
   
 	ldr	r0,=GPFCON
 	ldr	r1,=0x55aa
-	str	r1,[r0]
-;	ldr	r0,=GPFUP
-;	ldr	r1,=0xff
-;	str	r1,[r0]
+	str	r1,[r0]		;GPF7~4为输出，GPF3~0为中断
+	;上拉功能无效 
+	;	ldr	r0,=GPFUP
+	;	ldr	r1,=0xff
+	;	str	r1,[r0]
 	ldr	r0,=GPFDAT
 	ldr	r1,=0x0
 	str	r1,[r0]	;LED=****
@@ -370,8 +421,9 @@ StartPointAfterSleepWakeUp
 	mov r7,#0
 	mov r8,#0
 	
-	ldr	r9,=0x4000000   ;64MB
-	ldr	r0,=0x30000000
+	ldr	r9,=0x4000000   ;64MB RAM 
+	ldr	r0,=0x30000000	;RAM首地址
+	;清空64MB的RAM 
 0	
 	stmia	r0!,{r1-r8}
 	subs	r9,r9,#32 
@@ -382,13 +434,15 @@ StartPointAfterSleepWakeUp
 1
 
  		;Initialize stacks
+		 ;初始化各种处理器模式下的堆栈 
 	bl	InitStacks
 
 ;===========================================================
-	
+;下面的代码为把ROM中的数据复制到RAM中 	
 	ldr	r0, =BWSCON
 	ldr	r0, [r0]
 	ands	r0, r0, #6		;OM[1:0] != 0, NOR FLash boot
+	;为0表示从NAND Flash启动，不为0则从NOR Flash启动
 	bne	copy_proc_beg		;do not read nand flash
 	adr	r0, ResetEntry		;OM[1:0] == 0, NAND FLash boot
 	cmp	r0, #0				;if use Multi-ice, 
@@ -397,49 +451,49 @@ StartPointAfterSleepWakeUp
 ;===========================================================
 nand_boot_beg
 	[ {TRUE}
-	bl CopyProgramFromNand
+	bl CopyProgramFromNand	;复制NAND Flash到SDRAM
 	|
-	mov	r5, #NFCONF
+	mov	r5, #NFCONF		;设置NAND FLASH的控制寄存器
 	;set timing value
 	ldr	r0,	=(7<<12)|(7<<8)|(7<<4)
 	str	r0,	[r5]
 	;enable control
 	ldr	r0, =(0<<13)|(0<<12)|(0<<10)|(0<<9)|(0<<8)|(1<<6)|(1<<5)|(1<<4)|(1<<1)|(1<<0)
-	str	r0, [r5, #4]
+	str	r0, [r5, #4]	;设置NFCONT，使能NAND FLASH 控制;禁止片选;初始化ECC等，具体查看手册 
 	
-	bl	ReadNandID
-	mov	r6, #0
-	ldr	r0, =0xec73
-	cmp	r5,	r0
-	beq	%F1
-	ldr	r0, =0xec75
-	cmp	r5, r0
-	beq	%F1
-	mov	r6, #1
+	bl	ReadNandID		;接着读取NAND的ID号,结果保存在r5里
+	mov	r6, #0			;r6设初值0 
+	ldr	r0, =0xec73		;期望的NAND ID号 
+	cmp	r5,	r0			;这里进行比较 
+	beq	%F1				;相等的话就跳到下一个1标号处 
+	ldr	r0, =0xec75		;这是另一个期望值 
+	cmp	r5, r0			;再进行比较 
+	beq	%F1				;相等的话就跳到下一个1标号处 
+	mov	r6, #1			;不相等了,设置r6=1 
 1	
-	bl	ReadNandStatus
+	bl	ReadNandStatus	;读取NAND状态,结果放在r1里(bl指令自动放到R1) 
 	
-	mov	r8, #0
-	ldr	r9, =ResetEntry
+	mov	r8, #0			;r8设初值0,意义为页号 
+	ldr	r9, =ResetEntry	;对于ResetEntry，整个文件只有这一处用ldr,其他地方用到都是adr 
 2	
-	ands	r0, r8, #0x1f
-	bne		%F3
+	ands	r0, r8, #0x1f	;凡r8为0x1f(32)的整数倍,eq有效,ne无效;对每个块(32页)进行检错 
+	bne		%F3		;如果没错，跳到标号3 
 	mov		r0, r8
-	bl		CheckBadBlk
-	cmp		r0, #0
-	addne	r8, r8, #32
-	bne		%F4
+	bl		CheckBadBlk		;检查NAND的坏区 
+	cmp		r0, #0			;比较r0和0
+	addne	r8, r8, #32		 ;存在坏块的话就跳过这个坏块
+	bne		%F4				;没有的话就跳到标号4处 3 
 3	
-	mov	r0, r8
-	mov	r1, r9
-	bl	ReadNandPage
-	add	r9, r9, #512
-	add	r8, r8, #1
+	mov	r0, r8			;当前页号->r0 
+	mov	r1, r9			;当前目标地址->r1,即将|Image$$RO$$Base|赋值给R1 
+	bl	ReadNandPage	;读取该页的NAND数据到RAM	
+	add	r9, r9, #512	;每一页的大小是512Bytes
+	add	r8, r8, #1		;r8指向下一页 4 
 4	
-	cmp	r8, #5120
-	bcc	%B2
+	cmp	r8, #5120		;比较是否读完5120页 
+	bcc	%B2				;如果r8小于5120(没读完),就返回前面的标号2处 
 	
-	mov	r5, #NFCONF			;DsNandFlash
+	mov	r5, #NFCONF			;DsNandFlash ;设置NAND FLASH 控制寄存器
 	ldr	r0, [r5, #4]
 	bic r0, r0, #1
 	str	r0, [r5, #4]
@@ -449,28 +503,30 @@ nand_boot_beg
 copy_proc_beg
 	adr	r0, ResetEntry
 	ldr	r2, BaseOfROM
-	cmp	r0, r2
-	ldreq	r0, TopOfROM
-	beq	InitRam	
-	ldr r3, TopOfROM
+	cmp	r0, r2		 ;比较程序入口地址与连接器定义的RO基地址
+	ldreq	r0, TopOfROM		;如果相等，把RO尾地址读取到r0中
+	beq	InitRam		;如果相等，则跳转 	
+	ldr r3, TopOfROM		;否则，把RO尾地址读取到r3中		
+	;下列循环体为在程序入口地址与连接器定义的RO基地址不相等的情况下，把程序复制到RAM中 
 0	
 	ldmia	r0!, {r4-r7}
 	stmia	r2!, {r4-r7}
 	cmp	r2, r3
 	bcc	%B0
-	
+;修正非字对齐的情况 	
 	sub	r2, r2, r3
 	sub	r0, r0, r2				
 		
 InitRam	
 	ldr	r2, BaseOfBSS
 	ldr	r3, BaseOfZero	
+;下面循环体为复制已初始化的全局变量 0 
 0
 	cmp	r2, r3
 	ldrcc	r1, [r0], #4
 	strcc	r1, [r2], #4
 	bcc	%B0	
-
+;下面循环体是为未初始化的全局变量赋值为0 
 	mov	r0,	#0
 	ldr	r3,	EndOfBSS
 1	
@@ -483,13 +539,17 @@ InitRam
 	
 ;	[ CLKDIV_VAL>1 		; means Fclk:Hclk is not 1:1.
 ;	bl	MMU_SetAsyncBusMode
+;设置时钟模式为异步模式 
 ;	|
 ;	bl MMU_SetFastBusMode	; default value.
+;设置时钟模式为快速总线模式 
 ;	]
 	
 	;bl	Led_Test
 
 ;===========================================================
+;普通中断处理 
+;当普通中断发生时，执行的是IsrIRQ 
   	; Setup IRQ handler
 	ldr	r0,=HandleIRQ       ;This routine is needed
 	ldr	r1,=IsrIRQ	  ;if there is not 'subs pc,lr,#4' at 0x18, 0x1c
@@ -516,6 +576,9 @@ InitRam
 ;	strcc	r2, [r3], #4
 ;	bcc	%B3
 
+;完成最基本的初始化任务，跳转到由C语言撰写的Main()函数内继续执行其他程序 
+;这里不能写main，因为写了main，系统会自动为我们完成一些初始化工作，
+;而这些工作在这段程序中是由我们显式地人为完成的。
 
     [ :LNOT:THUMBCODE
  		bl	Main	;Do not use main() because ......
@@ -532,12 +595,14 @@ InitRam
 		CODE32
     ]
 
-
+;初始化堆栈函数 
 ;function initializing stacks
 InitStacks
 	;Do not use DRAM,such as stmfd,ldmfd......
 	;SVCstack is initialized before
 	;Under toolkit ver 2.5, 'msr cpsr,r1' can be used instead of 'msr cpsr_cxsf,r1'
+;改变CPSR中M控制位，切换到相应的处理器模式下
+;为各自模式下的SP赋值
 	mrs	r0,cpsr
 	bic	r0,r0,#MODEMASK
 	orr	r1,r0,#UNDEFMODE|NOINT
@@ -562,6 +627,8 @@ InitStacks
 	ldr	sp,=SVCStack		; SVCStack=0x33FF_5800
 
 	;USER mode has not be initialized.
+	;系统模式和用户模式共用一个栈空间，因此不用再重复设置用户模式堆栈 系统复位后进入的是SVC模式，
+	;而且各种模式下的lr不同，因此要想从该函数内返回，要首先切换到SVC模式，再使用lr，这样可以正确返回了
 
 	mov	pc,lr
 	;The LR register will not be valid if the current mode is not SVC mode.
@@ -714,12 +781,14 @@ ReadNandPage
 ;GCS6->SDRAM
 ;GCS7->unused
 
-SMRDATA DATA
+;连续13个内存控制寄存器的定义空间
+SMRDATA DATA	;SMRDATA是段名，DATA是属性(定义为数据段)
 ; Memory configuration should be optimized for best performance
 ; The following parameter is not optimized.
 ; Memory access cycle parameter strategy
 ; 1) The memory settings is  safe parameters even at HCLK=75Mhz.
 ; 2) SDRAM refresh period is for HCLK<=75Mhz.
+;DCD指令用于分配一片连续的字存储单元并用伪指令中指定的表达式初始化 
 
 	DCD (0+(B1_BWSCON<<4)+(B2_BWSCON<<8)+(B3_BWSCON<<12)+(B4_BWSCON<<16)+(B5_BWSCON<<20)+(B6_BWSCON<<24)+(B7_BWSCON<<28))
 	DCD ((B0_Tacs<<13)+(B0_Tcos<<11)+(B0_Tacc<<8)+(B0_Tcoh<<6)+(B0_Tah<<4)+(B0_Tacp<<2)+(B0_PMC))   ;GCS0
@@ -736,14 +805,14 @@ SMRDATA DATA
 
 	DCD 0x30	    ;MRSR6 CL=3clk
 	DCD 0x30	    ;MRSR7 CL=3clk
-	
+;运行域定义 	
 BaseOfROM	DCD	|Image$$RO$$Base|
 TopOfROM	DCD	|Image$$RO$$Limit|
 BaseOfBSS	DCD	|Image$$RW$$Base|
 BaseOfZero	DCD	|Image$$ZI$$Base|
 EndOfBSS	DCD	|Image$$ZI$$Limit|
 
-	ALIGN
+	ALIGN	;重新使数据字对齐 
 	
 ;Function for entering power down mode
 ; 1. SDRAM should be in self-refresh mode.
@@ -751,68 +820,76 @@ EndOfBSS	DCD	|Image$$ZI$$Limit|
 ; 3. LCD controller should be disabled for SDRAM/DRAM self-refresh.
 ; 4. The I-cache may have to be turned on.
 ; 5. The location of the following code may have not to be changed.
-
+;掉电模式函数 
 ;void EnterPWDN(int CLKCON);
+;在C语言中定义为:#define EnterPWDN(clkcon) ((void (*)(int))0x20)(clkcon) 
 EnterPWDN
 	mov r2,r0		;r2=rCLKCON
+	;r0为该函数输入参数clkcon 
 	tst r0,#0x8		;SLEEP mode?
+	;判断clkcon中的第3位，是否要切换到SLEEP模式
 	bne ENTER_SLEEP
+	;切换到SLEEP模式 
 
-ENTER_STOP
+ENTER_STOP ;IDLE模式
 	ldr r0,=REFRESH
+	;设置SDRAM为自刷新方式
 	ldr r3,[r0]		;r3=rREFRESH
 	mov r1, r3
 	orr r1, r1, #BIT_SELFREFRESH
 	str r1, [r0]		;Enable SDRAM self-refresh
-
+;等待一段时间 
 	mov r1,#16			;wait until self-refresh is issued. may not be needed.
 0	subs r1,r1,#1
 	bne %B0
 
 	ldr r0,=CLKCON		;enter STOP mode.
-	str r2,[r0]
-
+	str r2,[r0]	;置第2位，进入IDLE模式 
+;等待一段时间 
 	mov r1,#32
 0	subs r1,r1,#1	;1) wait until the STOP mode is in effect.
 	bne %B0		;2) Or wait here until the CPU&Peripherals will be turned-off
 			;   Entering SLEEP mode, only the reset by wake-up is available.
-
+;从IDLE模式下被唤醒，系统从该处继续执行
+;取消SDRAM自刷新方式 
 	ldr r0,=REFRESH ;exit from SDRAM self refresh mode.
 	str r3,[r0]
 
-	MOV_PC_LR
+	MOV_PC_LR	;返回，该语句为一个宏定义 
 
-ENTER_SLEEP
+ENTER_SLEEP	;SLEEP模式 
 	;NOTE.
 	;1) rGSTATUS3 should have the return address after wake-up from SLEEP mode.
 
 	ldr r0,=REFRESH
+	;设置SDRAM为自刷新方式 
 	ldr r1,[r0]		;r1=rREFRESH
 	orr r1, r1, #BIT_SELFREFRESH
 	str r1, [r0]		;Enable SDRAM self-refresh
-
+;等待一段时间 
 	mov r1,#16			;Wait until self-refresh is issued,which may not be needed.
 0	subs r1,r1,#1
 	bne %B0
-
+;在进入SLEEP模式之前，配置必要的时钟和OFFREFRESH
 	ldr	r1,=MISCCR
 	ldr	r0,[r1]
 	orr	r0,r0,#(7<<17)  ;Set SCLK0=0, SCLK1=0, SCKE=0.
 	str	r0,[r1]
 
 	ldr r0,=CLKCON		; Enter sleep mode
-	str r2,[r0]
+	str r2,[r0]		;置第3位，进入SLEEP模式 
 
 	b .			;CPU will die here.
 
-
+;从SLEEP模式下被唤醒函数 
 WAKEUP_SLEEP
 	;Release SCLKn after wake-up from the SLEEP mode.
+	;设置时钟和OFFREFRESH 
 	ldr	r1,=MISCCR
 	ldr	r0,[r1]
 	bic	r0,r0,#(7<<17)  ;SCLK0:0->SCLK, SCLK1:0->SCLK, SCKE:0->=SCKE.
 	str	r0,[r1]
-
+	;配置内存控制寄存器 
 	;Set memory control registers
  	ldr	r0,=SMRDATA	;be careful! 
 	ldr	r1,=BWSCON	;BWSCON Address
@@ -822,15 +899,15 @@ WAKEUP_SLEEP
 	str	r3, [r1], #4
 	cmp	r2, r0
 	bne	%B0
-
+;等待一段时间 
 	mov r1,#256
 0	subs r1,r1,#1	;1) wait until the SelfRefresh is released.
 	bne %B0
-
+;GSTATUS3存放着想要从SLEEP模式唤醒后的执行地址
 	ldr r1,=GSTATUS3 	;GSTATUS3 has the start address just after SLEEP wake-up
 	ldr r0,[r1]
 
-	mov pc,r0
+	mov pc,r0		;跳转到GSTATUS3存放的地址处 
 	
 ;=====================================================================
 ; Clock division test
@@ -889,9 +966,12 @@ CLKDIV144
 	mov     pc, lr
 
 
-	ALIGN
+	ALIGN		;使得下面的代码按一定规则对齐 
 
 	AREA RamData, DATA, READWRITE
+;在0x33FF_FF00处定义中断向量表 
+;^符号相当于伪指令MAP，用于定义一个结构化的内存表的首地址
+;#是FIELD的同义词 
 
 	^   _ISR_STARTADDRESS		; _ISR_STARTADDRESS=0x33FF_FF00
 HandleReset 	#   4
@@ -941,4 +1021,4 @@ HandleSPI1 		#   4
 HandleRTC 		#   4
 HandleADC 		#   4
 ;@0x33FF_FFA0
-	END
+	END		;程序结尾 
